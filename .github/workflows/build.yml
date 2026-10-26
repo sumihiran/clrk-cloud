@@ -1,0 +1,172 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: clrk repository to build
+        default: sumihiran/clrk
+      ref:
+        description: Branch, tag, or SHA to build
+        default: main
+  # Same event clrk's ci.yml sends to apoxy-cloud, so a clrk fork can point
+  # its dispatch here. Payload: {"sha": "...", "repository": "owner/name"}.
+  repository_dispatch:
+    types: [clrk-build]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-${{ github.event.inputs.ref || github.event.client_payload.sha || 'main' }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.resolve.outputs.repository }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.event.inputs.repository || github.event.client_payload.repository || 'sumihiran/clrk' }}
+          REF: ${{ github.event.inputs.ref || github.event.client_payload.sha || 'main' }}
+        run: |
+          sha="$(gh api "repos/${REPOSITORY}/commits/${REF}" -q .sha)"
+          # Matches clrk's drivers.ImageTag(): first 8 hex chars of the SHA.
+          echo "repository=${REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "tag=${sha:0:8}" >> "$GITHUB_OUTPUT"
+          echo "Building ${REPOSITORY}@${sha}" >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [controller-manager, worker]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve.outputs.repository }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: clrk
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.component }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/clrk-${{ matrix.component }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.description=clrk ${{ matrix.component }} built from ${{ needs.resolve.outputs.repository }}@${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }}
+
+  manifest:
+    needs: [resolve, image]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [controller-manager, worker]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Create multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/clrk-${{ matrix.component }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          docker buildx imagetools create -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" \
+            "${IMAGE}:${TAG}-amd64" "${IMAGE}:${TAG}-arm64"
+          echo "Pushed \`${IMAGE}:${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [resolve, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve.outputs.repository }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: clrk
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clrk/go.mod
+          cache-dependency-path: clrk/go.sum
+      - name: Build clrk CLI
+        working-directory: clrk
+        run: |
+          mkdir -p ../dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "../build/clrk_${os}_${arch}/clrk" ./cmd/clrk
+            tar -C "../build/clrk_${os}_${arch}" -czf "../dist/clrk_${os}_${arch}.tar.gz" clrk
+          done
+      - name: Extract controller-manager and worker binaries
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          for component in controller-manager worker; do
+            for arch in amd64 arm64; do
+              dir="build/${component}_linux_${arch}"
+              mkdir -p "$dir"
+              id="$(docker create --platform "linux/${arch}" "${REGISTRY}/clrk-${component}:${TAG}")"
+              docker cp "${id}:/usr/local/bin/${component}" "${dir}/${component}"
+              docker rm "$id" >/dev/null
+              tar -C "$dir" -czf "dist/${component}_linux_${arch}.tar.gz" "$component"
+            done
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.resolve.outputs.repository }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          release="clrk-${TAG}"
+          cat > notes.md <<EOF
+          Built from [${REPOSITORY}@${TAG}](https://github.com/${REPOSITORY}/commit/${SHA}).
+
+          Images:
+          - \`${REGISTRY}/clrk-controller-manager:${TAG}\`
+          - \`${REGISTRY}/clrk-worker:${TAG}\`
+          EOF
+          if gh release view "$release" >/dev/null 2>&1; then
+            gh release upload "$release" dist/* --clobber
+          else
+            gh release create "$release" dist/* --title "clrk ${TAG}" --notes-file notes.md
+          fi

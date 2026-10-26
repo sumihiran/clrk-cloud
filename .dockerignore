@@ -1,0 +1,6 @@
+.git
+.github
+clrk/.git
+clrk/console/node_modules
+clrk/console/**/node_modules
+clrk/console/apps/clrk-console/dist

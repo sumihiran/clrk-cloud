@@ -1,0 +1,4 @@
+# clrk checkout used for local builds.
+/clrk/
+/build/
+/dist/
