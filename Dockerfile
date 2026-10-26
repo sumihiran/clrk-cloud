@@ -40,12 +40,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X github.com/apoxy-dev/clrk/internal/version.version=${VERSION}" \
       -o /out/controller-manager ./cmd/controller-manager
 
-# The worker links libcontainer's nsenter, so it needs cgo (glibc).
+# The worker must be static: gVisor's runsc re-executes /proc/self/exe after
+# pivoting into an empty root, where no dynamic loader exists.
 FROM source AS build-worker
 ARG VERSION=""
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOFLAGS=-mod=mod go build -trimpath \
+    CGO_ENABLED=0 GOFLAGS=-mod=mod go build -trimpath \
       -ldflags="-s -w -X github.com/apoxy-dev/clrk/internal/version.version=${VERSION}" \
       -o /out/worker ./cmd/worker
 
