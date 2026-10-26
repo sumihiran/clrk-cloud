@@ -10,7 +10,7 @@ on:
         description: Branch, tag, or SHA to build
         default: main
       version:
-        description: Version to stamp (default: a v* tag on the commit, if any)
+        description: "Version to stamp (default: a v* tag on the commit, if any)"
         required: false
   # Same event clrk's ci.yml sends to apoxy-cloud, so a clrk fork can point
   # its dispatch here. Payload: {"sha": "...", "repository": "owner/name"}.
