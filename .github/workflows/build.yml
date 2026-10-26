@@ -153,6 +153,8 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          # The workspace root isn't a git checkout, so gh can't infer the repo.
+          GH_REPO: ${{ github.repository }}
           REPOSITORY: ${{ needs.resolve.outputs.repository }}
           SHA: ${{ needs.resolve.outputs.sha }}
           TAG: ${{ needs.resolve.outputs.tag }}
