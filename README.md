@@ -7,15 +7,18 @@ same job with a plain Dockerfile and GitHub Actions.
 ## Artifacts
 
 Each build is tagged with the first 8 hex characters of the clrk commit SHA, the same tag
-clrk's `drivers.ImageTag()` derives.
+clrk's `drivers.ImageTag()` derives. When the commit carries a `v*` git tag (or the `version`
+input is set), images also get that tag, the version is linked into every binary
+(`internal/version`), and the release is named after it. Versions with a `-` suffix
+(`v0.1.0-rc.1`) are published as pre-releases.
 
 | Artifact | Where |
 |---|---|
 | controller-manager image (amd64, arm64) | `ghcr.io/sumihiran/clrk-controller-manager:<tag>` |
 | worker image (amd64, arm64) | `ghcr.io/sumihiran/clrk-worker:<tag>` |
-| `clrk` CLI, controller-manager, worker binaries | [Releases](https://github.com/sumihiran/clrk-cloud/releases), as `clrk-<tag>` |
+| `clrk` CLI, controller-manager, worker binaries | [Releases](https://github.com/sumihiran/clrk-cloud/releases), as `<version>` or `clrk-<tag>` |
 
-`:latest` points at the most recent build.
+`:latest` points at the most recent build that isn't a pre-release.
 
 The controller-manager image includes the console bundle, `envoy-gateway` (v1.4.0) and
 `clickhouse`, at the paths its flags default to. The Envoy data-plane image (`--envoy-image`)

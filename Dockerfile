@@ -32,17 +32,21 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # cgo is required: the embedded apiserver's kine storage uses go-sqlite3.
 FROM source AS build-controller-manager
+ARG VERSION=""
 COPY --from=console /src/console/apps/clrk-console/dist/ /src/internal/console/dist/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' \
+    CGO_ENABLED=1 GOFLAGS=-mod=mod go build -trimpath \
+      -ldflags="-s -w -X github.com/apoxy-dev/clrk/internal/version.version=${VERSION}" \
       -o /out/controller-manager ./cmd/controller-manager
 
 # The worker links libcontainer's nsenter, so it needs cgo (glibc).
 FROM source AS build-worker
+ARG VERSION=""
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' \
+    CGO_ENABLED=1 GOFLAGS=-mod=mod go build -trimpath \
+      -ldflags="-s -w -X github.com/apoxy-dev/clrk/internal/version.version=${VERSION}" \
       -o /out/worker ./cmd/worker
 
 FROM debian:bookworm-slim AS runtime

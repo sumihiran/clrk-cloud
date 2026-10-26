@@ -9,6 +9,9 @@ on:
       ref:
         description: Branch, tag, or SHA to build
         default: main
+      version:
+        description: Version to stamp (default: a v* tag on the commit, if any)
+        required: false
   # Same event clrk's ci.yml sends to apoxy-cloud, so a clrk fork can point
   # its dispatch here. Payload: {"sha": "...", "repository": "owner/name"}.
   repository_dispatch:
@@ -32,19 +35,35 @@ jobs:
       repository: ${{ steps.resolve.outputs.repository }}
       sha: ${{ steps.resolve.outputs.sha }}
       tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.event.inputs.repository || github.event.client_payload.repository || 'sumihiran/clrk' }}
           REF: ${{ github.event.inputs.ref || github.event.client_payload.sha || 'main' }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
           sha="$(gh api "repos/${REPOSITORY}/commits/${REF}" -q .sha)"
+          if [[ -z "$VERSION" ]]; then
+            # Highest v* tag pointing at the commit. Annotated tags list the
+            # commit on their peeled "^{}" line.
+            VERSION="$(git ls-remote --tags "https://github.com/${REPOSITORY}.git" 'v*' |
+              awk -v sha="$sha" '$1 == sha { sub("refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' |
+              sort -uV | tail -n1)"
+          fi
+          prerelease=false
+          [[ "$VERSION" == *-* ]] && prerelease=true
           # Matches clrk's drivers.ImageTag(): first 8 hex chars of the SHA.
-          echo "repository=${REPOSITORY}" >> "$GITHUB_OUTPUT"
-          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          echo "tag=${sha:0:8}" >> "$GITHUB_OUTPUT"
-          echo "Building ${REPOSITORY}@${sha}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "repository=${REPOSITORY}"
+            echo "sha=${sha}"
+            echo "tag=${sha:0:8}"
+            echo "version=${VERSION}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${REPOSITORY}@${sha} version=${VERSION:-none}" >> "$GITHUB_STEP_SUMMARY"
 
   image:
     needs: resolve
@@ -81,6 +100,8 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: true
           provenance: false
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
           tags: ${{ env.REGISTRY }}/clrk-${{ matrix.component }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -107,10 +128,16 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/clrk-${{ matrix.component }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
-          docker buildx imagetools create -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" \
+          tags=("$TAG")
+          [[ -n "$VERSION" ]] && tags+=("$VERSION")
+          # Pre-releases don't move :latest.
+          [[ "$PRERELEASE" != true ]] && tags+=(latest)
+          docker buildx imagetools create "${tags[@]/#/--tag=${IMAGE}:}" \
             "${IMAGE}:${TAG}-amd64" "${IMAGE}:${TAG}-arm64"
-          echo "Pushed \`${IMAGE}:${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed \`${IMAGE}\` as: ${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
 
   release:
     needs: [resolve, manifest]
@@ -127,11 +154,15 @@ jobs:
           cache-dependency-path: clrk/go.sum
       - name: Build clrk CLI
         working-directory: clrk
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           mkdir -p ../dist
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"; arch="${target#*/}"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "../build/clrk_${os}_${arch}/clrk" ./cmd/clrk
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags="-s -w -X github.com/apoxy-dev/clrk/internal/version.version=${VERSION}" \
+              -o "../build/clrk_${os}_${arch}/clrk" ./cmd/clrk
             tar -C "../build/clrk_${os}_${arch}" -czf "../dist/clrk_${os}_${arch}.tar.gz" clrk
           done
       - name: Extract controller-manager and worker binaries
@@ -158,17 +189,22 @@ jobs:
           REPOSITORY: ${{ needs.resolve.outputs.repository }}
           SHA: ${{ needs.resolve.outputs.sha }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
-          release="clrk-${TAG}"
+          release="${VERSION:-clrk-${TAG}}"
+          image_tag="${VERSION:-${TAG}}"
           cat > notes.md <<EOF
           Built from [${REPOSITORY}@${TAG}](https://github.com/${REPOSITORY}/commit/${SHA}).
 
           Images:
-          - \`${REGISTRY}/clrk-controller-manager:${TAG}\`
-          - \`${REGISTRY}/clrk-worker:${TAG}\`
+          - \`${REGISTRY}/clrk-controller-manager:${image_tag}\`
+          - \`${REGISTRY}/clrk-worker:${image_tag}\`
           EOF
+          flags=()
+          [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
           if gh release view "$release" >/dev/null 2>&1; then
             gh release upload "$release" dist/* --clobber
           else
-            gh release create "$release" dist/* --title "clrk ${TAG}" --notes-file notes.md
+            gh release create "$release" dist/* --title "clrk ${VERSION:-${TAG}}" --notes-file notes.md "${flags[@]}"
           fi
